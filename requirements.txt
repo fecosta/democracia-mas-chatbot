@@ -1,0 +1,7 @@
+streamlit==1.39.0
+openai==1.51.2
+pypdf==4.3.1
+langdetect==1.0.9
+numpy==1.26.4
+tiktoken==0.7.0
+# faiss-cpu (optional, local only)
