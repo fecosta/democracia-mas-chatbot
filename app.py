@@ -1,40 +1,59 @@
+# Democracia+ Chatbot (Improved Version)
+# --------------------------------------
 # Requirements (install before running):
-#   pip install streamlit openai pypdf langdetect tiktoken numpy
-#   (Optional) pip install faiss-cpu
-# Run:
+#   pip install streamlit openai pypdf numpy
+#
+# Optional (for deployment / persistence):
+#   - Configure a writable "data" folder for documents and index
+#   - Set OPENAI_API_KEY env var (and optionally OPENAI_CHAT_MODEL)
+#
+# Run locally:
 #   export OPENAI_API_KEY=your_key_here
 #   streamlit run app.py
 
 import os
 import io
-import hashlib
+import json
 import time
-from dataclasses import dataclass
-from typing import List, Tuple
+import hashlib
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import streamlit as st
-from langdetect import detect
 from pypdf import PdfReader
 from openai import OpenAI
 
-# --------------- Config ---------------
-OPENAI_EMBED_MODEL = "text-embedding-3-large"
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")  # default
-MAX_CHUNK_TOKENS = 900
-CHUNK_OVERLAP_TOKENS = 120
-TOP_K = 6
-TEMPERATURE = 0.2
+# ----------------------- Global config & constants -----------------------
 
-# --------------- Utilities ---------------
-client = OpenAI()
-try:
-    _ = client.models.retrieve(OPENAI_CHAT_MODEL)
-except Exception:
-    pass
+DATA_DIR = os.environ.get("DPLUS_DATA_DIR", "data")
+DOCS_DIR = os.path.join(DATA_DIR, "docs")
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
-def _hash_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()[:12]
+DEFAULT_CONFIG = {
+    "chat_model": os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+    "embedding_model": "text-embedding-3-large",
+    "temperature": 0.25,
+    "top_k": 6,
+    "max_history_messages": 6,
+    "default_answer_lang": "auto",  # auto | es | pt | en
+}
+
+SUPPORTED_CHAT_MODELS = [
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+]
+
+ANSWER_LANG_OPTIONS = {
+    "Auto": "auto",
+    "Español": "es",
+    "Português": "pt",
+    "English": "en",
+}
+
+# ----------------------- Data structures -----------------------
 
 @dataclass
 class Chunk:
@@ -42,16 +61,78 @@ class Chunk:
     source_name: str
     section_path: str
     page_number: int | None = None
-    lang: str | None = None
 
 @dataclass
 class Corpus:
     chunks: List[Chunk]
-    embeddings: np.ndarray
+    embeddings: np.ndarray  # shape: (n_chunks, dim)
+
+# ----------------------- OpenAI client -----------------------
+
+client = OpenAI()
+
+def check_openai_key():
+    if not os.environ.get("OPENAI_API_KEY"):
+        st.error(
+            "OPENAI_API_KEY is not set. Please add it as an environment variable "
+            "in your deployment platform."
+        )
+        st.stop()
+
+# ----------------------- Persistence helpers -----------------------
+
+def ensure_data_dirs():
+    os.makedirs(DOCS_DIR, exist_ok=True)
+
+def load_config() -> Dict[str, Any]:
+    ensure_data_dirs()
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            # merge with defaults to avoid missing keys
+            updated = DEFAULT_CONFIG.copy()
+            updated.update(cfg)
+            return updated
+        except Exception:
+            return DEFAULT_CONFIG.copy()
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg: Dict[str, Any]) -> None:
+    ensure_data_dirs()
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+def list_document_files() -> List[Tuple[str, str, float]]:
+    """
+    Returns list of (name, path, mtime) for each document in DOCS_DIR.
+    """
+    ensure_data_dirs()
+    files: List[Tuple[str, str, float]] = []
+    for name in sorted(os.listdir(DOCS_DIR)):
+        path = os.path.join(DOCS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        if not name.lower().endswith((".pdf", ".txt", ".md")):
+            continue
+        mtime = os.path.getmtime(path)
+        files.append((name, path, mtime))
+    return files
+
+def delete_document(name: str) -> None:
+    path = os.path.join(DOCS_DIR, name)
+    if os.path.exists(path):
+        os.remove(path)
+
+# ----------------------- Text splitting & embeddings -----------------------
 
 def split_text(text: str, max_chars: int = 3500, overlap_chars: int = 500) -> List[str]:
+    """
+    Simple paragraph splitter with overlap. Works on characters, not tokens,
+    but is good enough for our use case and keeps dependencies light.
+    """
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
+    chunks: List[str] = []
     buf = ""
     for p in paragraphs:
         if len(buf) + len(p) + 2 <= max_chars:
@@ -61,140 +142,378 @@ def split_text(text: str, max_chars: int = 3500, overlap_chars: int = 500) -> Li
                 chunks.append(buf)
             while len(p) > max_chars:
                 chunks.append(p[:max_chars])
-                p = p[max_chars - overlap_chars:]
+                p = p[max_chars - overlap_chars :]
             buf = p
     if buf:
         chunks.append(buf)
-    with_overlap = []
-    prev_tail = ""
-    for c in chunks:
-        seg = (prev_tail + "\n\n" + c) if prev_tail else c
-        with_overlap.append(seg)
-        prev_tail = c[-overlap_chars:]
-    return with_overlap
+    return chunks
 
-@st.cache_resource(show_spinner=False)
-def embed_texts(texts: List[str]) -> np.ndarray:
+def embed_texts(model: str, texts: List[str]) -> np.ndarray:
     if not texts:
         return np.zeros((0, 3072), dtype=np.float32)
-    res = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=texts)
-    return np.array([d.embedding for d in res.data], dtype=np.float32)
 
-@st.cache_resource(show_spinner=False)
-def build_corpus(files_payload: List[Tuple[str, bytes]]) -> Corpus:
+    res = client.embeddings.create(model=model, input=texts)
+    # We assume text-embedding-3-large dim (3072). If another is used, numpy will infer.
+    vectors = np.array([d.embedding for d in res.data], dtype=np.float32)
+    return vectors
+
+@st.cache_resource(show_spinner=True)
+def build_corpus_from_disk(embed_model: str, file_infos: List[Tuple[str, str, float]]) -> Corpus:
+    """
+    file_infos: list of (name, path, mtime). mtime is used so that index is rebuilt
+    when a file is updated.
+    """
     chunks: List[Chunk] = []
-    for name, content in files_payload:
+
+    for name, path, _ in file_infos:
         ext = name.lower().split(".")[-1]
-        try:
-            if ext == "pdf":
-                reader = PdfReader(io.BytesIO(content))
-                for i, page in enumerate(reader.pages):
-                    text = page.extract_text() or ""
-                    if not text.strip():
-                        continue
-                    for j, t in enumerate(split_text(text)):
-                        try:
-                            lang = detect(t[:4000])
-                        except Exception:
-                            lang = None
-                        chunks.append(Chunk(text=t, source_name=name, section_path=f"page-{i+1}/chunk-{j+1}", page_number=i+1, lang=lang))
-            elif ext in ("txt", "md"):
-                text = content.decode("utf-8", errors="ignore")
+        with open(path, "rb") as f:
+            content_bytes = f.read()
+
+        if ext == "pdf":
+            reader = PdfReader(io.BytesIO(content_bytes))
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                if not text.strip():
+                    continue
                 for j, t in enumerate(split_text(text)):
-                    try:
-                        lang = detect(t[:4000])
-                    except Exception:
-                        lang = None
-                    chunks.append(Chunk(text=t, source_name=name, section_path=f"chunk-{j+1}", page_number=None, lang=lang))
-        except Exception as e:
-            st.warning(f"Failed to ingest {name}: {e}")
-    emb = embed_texts([c.text for c in chunks])
-    return Corpus(chunks=chunks, embeddings=emb)
+                    chunks.append(
+                        Chunk(
+                            text=t,
+                            source_name=name,
+                            section_path=f"page-{i+1}/chunk-{j+1}",
+                            page_number=i + 1,
+                        )
+                    )
+        elif ext in ("txt", "md"):
+            text = content_bytes.decode("utf-8", errors="ignore")
+            for j, t in enumerate(split_text(text)):
+                chunks.append(
+                    Chunk(
+                        text=t,
+                        source_name=name,
+                        section_path=f"chunk-{j+1}",
+                        page_number=None,
+                    )
+                )
 
-@st.cache_resource(show_spinner=False)
-def embed_query(q: str) -> np.ndarray:
-    e = client.embeddings.create(model=OPENAI_EMBED_MODEL, input=[q])
-    return np.array(e.data[0].embedding, dtype=np.float32)
+    embeddings = embed_texts(embed_model, [c.text for c in chunks])
+    return Corpus(chunks=chunks, embeddings=embeddings)
 
-def top_k_similar(query_vec: np.ndarray, matrix: np.ndarray, k: int = 6) -> List[int]:
-    if matrix.size == 0:
+# ----------------------- Retrieval -----------------------
+
+def retrieve_similar(corpus: Corpus, query: str, embed_model: str, top_k: int) -> List[Tuple[Chunk, float]]:
+    if not corpus.chunks:
         return []
-    q = query_vec / (np.linalg.norm(query_vec) + 1e-9)
-    m = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9)
-    sims = m @ q
-    return np.argsort(-sims)[:k].tolist()
 
-# --------------- Streamlit UI ---------------
-st.set_page_config(page_title="Democracia+ Chatbot POC", page_icon="🗳️", layout="wide")
-st.title("🗳️ Democracia+ Chatbot — Streamlit POC")
-st.caption("Ask questions grounded in Democracia+ playbooks (PDF/TXT). Upload files or use demo snippets.")
+    q_vec = embed_texts(embed_model, [query])[0]
+    doc_vecs = corpus.embeddings
 
-with st.sidebar:
-    st.header("Content")
-    uploaded_files = st.file_uploader("Upload PDFs or TXT", type=["pdf", "txt", "md"], accept_multiple_files=True)
-    demo = st.checkbox("Load demo snippets", value=not uploaded_files)
-    st.header("Options")
-    persona = st.selectbox("Persona", ["Facilitator", "Policy Maker"], index=0)
-    answer_lang = st.selectbox("Answer language", ["Auto", "Español", "Português", "English"], index=0)
+    # cosine similarity
+    q_norm = np.linalg.norm(q_vec) + 1e-8
+    doc_norms = np.linalg.norm(doc_vecs, axis=1) + 1e-8
+    sims = (doc_vecs @ q_vec) / (doc_norms * q_norm)
 
-payload: List[Tuple[str, bytes]] = []
-if uploaded_files:
-    for f in uploaded_files:
-        payload.append((f.name, f.read()))
-elif demo:
-    demo_es = "Playbook Democracia+: Módulo de Participación Ciudadana\n\nLa participación efectiva requiere transparencia."
-    demo_pt = "Playbook Democracia+: Módulo de Governança\n\nImplemente rituais de alinhamento quinzenais."
-    payload = [("demo_es.txt", demo_es.encode()), ("demo_pt.txt", demo_pt.encode())]
+    top_k = min(top_k, len(corpus.chunks))
+    idxs = np.argsort(-sims)[:top_k]
+    return [(corpus.chunks[i], float(sims[i])) for i in idxs]
 
-key_material = "|".join([f"{n}:{_hash_bytes(b)}" for n, b in payload]) if payload else "empty"
-if "_corpus_key" not in st.session_state or st.session_state._corpus_key != key_material:
-    st.session_state._corpus_key = key_material
-    st.session_state.corpus = build_corpus(payload) if payload else Corpus(chunks=[], embeddings=np.zeros((0, 1)))
+# ----------------------- Prompt construction -----------------------
 
-corpus: Corpus = st.session_state.corpus
-user_q = st.text_input("Question (es/pt/en)", placeholder="¿Cómo implemento mecanismos de escucha activa?")
-if st.button("Ask", disabled=not user_q):
-    try:
-        q_lang = detect(user_q)
-    except Exception:
-        q_lang = "es"
-
-    q_vec = embed_query(user_q)
-    idxs = top_k_similar(q_vec, corpus.embeddings, k=TOP_K)
-    retrieved = [corpus.chunks[i] for i in idxs]
-
-    context = "\n\n".join([f"[{i+1}] ({c.source_name} – {c.section_path})\n{c.text}" for i, c in enumerate(retrieved)])
-    persona_hint = {
-        "Facilitator": "You are a facilitator; give practical steps and exercises.",
-        "Policy Maker": "You advise officials; give governance guidance.",
-    }[persona]
-
-    system = (
-        "You are the Democracia+ assistant. Use only the CONTEXT."
-        " Cite sources as [1], [2]. If unsure, say you don't know."
-        + persona_hint
+def language_instruction(lang_code: str) -> str:
+    if lang_code == "es":
+        return "Responde en español latinoamericano claro y accesible."
+    if lang_code == "pt":
+        return "Responda em português brasileiro, de forma clara e acessível."
+    if lang_code == "en":
+        return "Answer in clear and accessible English."
+    return (
+        "Responde en el mismo idioma de la pregunta. Si la pregunta mezcla idiomas, "
+        "prioriza español o portugués según el contenido."
     )
-    user_prompt = f"QUESTION: {user_q}\n\nCONTEXT:\n{context}"
 
-    with st.spinner("Thinking..."):
+def build_system_prompt() -> str:
+    return (
+        "Eres el asistente oficial de Democracia+, una organización que trabaja para "
+        "fortalecer la democracia en América Latina. Respondes de manera rigurosa, "
+        "didáctica y constructiva, siempre fomentando la participación política, la "
+        "ética pública y el fortalecimiento institucional.\n\n"
+        "Usa EXCLUSIVAMENTE la información proporcionada en los documentos cargados "
+        "como contexto. Si no encuentras la respuesta allí, sé honesto y di que no "
+        "tienes información suficiente, sugiriendo cómo la persona podría profundizar "
+        "el tema.\n\n"
+        "Cuando te refieras explícitamente a partes de los documentos, cita las fuentes "
+        "entre corchetes con el formato [1], [2], etc."
+    )
+
+def build_context_block(retrieved: List[Tuple[Chunk, float]]) -> str:
+    lines = []
+    for idx, (chunk, score) in enumerate(retrieved, start=1):
+        loc = f"{chunk.source_name} — {chunk.section_path}"
+        lines.append(f"[{idx}] {loc}\n{chunk.text}")
+    return "\n\n".join(lines)
+
+def call_chat_api(
+    model: str,
+    temperature: float,
+    query: str,
+    retrieved: List[Tuple[Chunk, float]],
+    answer_lang: str,
+    history: List[Dict[str, str]],
+) -> str:
+    system_prompt = build_system_prompt()
+    lang_instr = language_instruction(answer_lang)
+    context_block = build_context_block(retrieved)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": f"Instrucción de idioma: {lang_instr}"},
+        {
+            "role": "system",
+            "content": (
+                "Contexto proveniente de los playbooks y materiales de Democracia+.\n"
+                "Utilízalo como base para tus respuestas, citando los fragmentos relevantes "
+                "como [1], [2], etc. cuando corresponda.\n\n"
+                f"{context_block}"
+            ),
+        },
+    ]
+
+    # Append short conversation history (without previous context blocks)
+    for m in history[-8:]:
+        messages.append(m)
+
+    messages.append({"role": "user", "content": query})
+
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        messages=messages,
+    )
+    return resp.choices[0].message.content
+
+# ----------------------- Streamlit UI helpers -----------------------
+
+def init_session_state(cfg: Dict[str, Any]):
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+    if "config" not in st.session_state:
+        st.session_state["config"] = cfg
+    if "last_index_mtime" not in st.session_state:
+        st.session_state["last_index_mtime"] = 0.0
+
+def add_message(role: str, content: str):
+    st.session_state["messages"].append({"role": role, "content": content})
+
+# ----------------------- Admin page -----------------------
+
+def render_admin_page():
+    st.title("D+ Chatbot — Admin")
+
+    st.markdown(
+        "Configure los modelos de OpenAI, suba nuevos documentos y gestione el índice "
+        "que el chatbot utiliza para responder."
+    )
+
+    cfg = st.session_state["config"]
+
+    st.subheader("Configuración de modelos")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        chat_model = st.selectbox(
+            "Modelo de chat",
+            options=SUPPORTED_CHAT_MODELS,
+            index=max(SUPPORTED_CHAT_MODELS.index(cfg.get("chat_model", DEFAULT_CONFIG["chat_model"])) if cfg.get("chat_model") in SUPPORTED_CHAT_MODELS else 0, 0),
+        )
+        temperature = st.slider("Temperatura", min_value=0.0, max_value=1.0, value=float(cfg.get("temperature", DEFAULT_CONFIG["temperature"])), step=0.05)
+
+    with col2:
+        answer_lang_label_to_code = ANSWER_LANG_OPTIONS
+        current_lang_code = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
+        current_label = next((label for label, code in answer_lang_label_to_code.items() if code == current_lang_code), "Auto")
+        answer_lang_label = st.selectbox("Idioma por defecto de la respuesta", list(answer_lang_label_to_code.keys()), index=list(answer_lang_label_to_code.keys()).index(current_label))
+        top_k = st.slider("Número de fragmentos de contexto (Top K)", min_value=2, max_value=12, value=int(cfg.get("top_k", DEFAULT_CONFIG["top_k"])))
+
+    if st.button("Guardar configuración"):
+        cfg["chat_model"] = chat_model
+        cfg["temperature"] = float(temperature)
+        cfg["top_k"] = int(top_k)
+        cfg["default_answer_lang"] = answer_lang_label_to_code[answer_lang_label]
+        st.session_state["config"] = cfg
+        save_config(cfg)
+        st.success("Configuración guardada.")
+
+    st.divider()
+    st.subheader("Documentos")
+
+    uploaded_files = st.file_uploader(
+        "Subir nuevos documentos (PDF, TXT, MD)",
+        type=["pdf", "txt", "md"],
+        accept_multiple_files=True,
+        help="Estos documentos alimentan el conocimiento del chatbot.",
+    )
+
+    if uploaded_files:
+        ensure_data_dirs()
+        for f in uploaded_files:
+            dest = os.path.join(DOCS_DIR, f.name)
+            with open(dest, "wb") as out:
+                out.write(f.read())
+        st.success("Documentos subidos. Recuerde reconstruir el índice si es necesario.")
+        st.button("Actualizar lista de documentos", on_click=lambda: None)
+
+    files = list_document_files()
+    if not files:
+        st.info("No hay documentos cargados todavía.")
+    else:
+        st.write(f"**{len(files)} documentos cargados:**")
+        for name, path, mtime in files:
+            cols = st.columns([4, 2, 1])
+            with cols[0]:
+                st.write(f"📄 {name}")
+            with cols[1]:
+                st.caption(time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)))
+            with cols[2]:
+                if st.button("Eliminar", key=f"del-{name}"):
+                    delete_document(name)
+                    st.warning(f"Documento '{name}' eliminado. Reconstruya el índice.")
+                    st.experimental_rerun()
+
+    st.divider()
+    st.subheader("Índice de búsqueda")
+
+    st.markdown(
+        "El índice de búsqueda se construye a partir de todos los documentos actuales. "
+        "Si agrega o elimina documentos, vuelva a construir el índice."
+    )
+
+    if st.button("Reconstruir índice ahora"):
+        # Clear cached corpus
+        build_corpus_from_disk.clear()
+        st.session_state["last_index_mtime"] = time.time()
+        st.success("Índice borrado; será reconstruido automáticamente la próxima vez que se use el chatbot.")
+
+# ----------------------- Chat page -----------------------
+
+def render_chat_page():
+    st.title("D+ Chatbot — Democracia+")
+    st.caption("Asistente para contenidos de Democracia+ basado en modelos de OpenAI.")
+
+    cfg = st.session_state["config"]
+    files = list_document_files()
+
+    if not files:
+        st.info(
+            "Aún no hay documentos cargados. Vaya a la pestaña **Admin** para subir "
+            "playbooks, artículos o transcripciones."
+        )
+        return
+
+    embed_model = cfg["embedding_model"]
+    top_k = int(cfg.get("top_k", DEFAULT_CONFIG["top_k"]))
+    answer_lang_default = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
+
+    # Sidebar options
+    with st.sidebar:
+        st.header("Opciones de respuesta")
+        answer_lang_label = st.selectbox("Idioma de la respuesta", list(ANSWER_LANG_OPTIONS.keys()))
+        answer_lang = ANSWER_LANG_OPTIONS[answer_lang_label]
+
+        persona = st.selectbox(
+            "Enfoque del asistente",
+            ["Facilitador/a", "Formador/a de liderazgos", "Diseñador/a de políticas públicas"],
+            index=0,
+        )
+
+    # Load / build corpus
+    file_infos_for_cache = [(name, path, mtime) for (name, path, mtime) in files]
+    corpus = build_corpus_from_disk(embed_model, file_infos_for_cache)
+
+    # Show chat history
+    for m in st.session_state["messages"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+
+    # User input
+    user_input = st.chat_input("Haz tu pregunta sobre los contenidos de Democracia+…")
+    if not user_input:
+        return
+
+    # Append user message
+    add_message("user", user_input)
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Retrieval
+    with st.spinner("Buscando en los materiales de Democracia+…"):
+        retrieved = retrieve_similar(
+            corpus=corpus,
+            query=user_input,
+            embed_model=embed_model,
+            top_k=top_k,
+        )
+
+    # Build answer
+    history = st.session_state["messages"][:-1]  # everything before this question
+    effective_lang = answer_lang if answer_lang != "auto" else answer_lang_default
+    # Add persona nuance as a small extra instruction in the last user message
+    persona_hint = (
+        "Responde con el enfoque de un/a "
+        f"{persona.lower()}, conectando la respuesta con ejemplos prácticos y "
+        "recomendaciones accionables."
+    )
+
+    composed_query = user_input + "\n\n" + persona_hint
+
+    with st.chat_message("assistant"):
         try:
-            chat = client.chat.completions.create(
-                model=OPENAI_CHAT_MODEL,
-                temperature=TEMPERATURE,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user_prompt}],
+            answer = call_chat_api(
+                model=cfg.get("chat_model", DEFAULT_CONFIG["chat_model"]),
+                temperature=float(cfg.get("temperature", DEFAULT_CONFIG["temperature"])),
+                query=composed_query,
+                retrieved=retrieved,
+                answer_lang=effective_lang,
+                history=history,
             )
-            answer = chat.choices[0].message.content
         except Exception as e:
-            st.error(f"OpenAI API error: {e}")
-            st.stop()
+            st.error(f"Error al llamar a la API de OpenAI: {e}")
+            return
 
-    st.markdown("### Answer")
-    st.write(answer)
+        st.markdown(answer)
+        add_message("assistant", answer)
 
-    with st.expander("Sources"):
-        for i, c in enumerate(retrieved, start=1):
-            st.markdown(f"**[{i}]** *{c.source_name}* — {c.section_path}")
-            st.text(c.text[:400] + ("..." if len(c.text) > 400 else ""))
+        # Show sources
+        with st.expander("Ver fuentes utilizadas"):
+            if not retrieved:
+                st.write("No se encontraron fragmentos relevantes en los documentos.")
+            else:
+                for idx, (chunk, score) in enumerate(retrieved, start=1):
+                    st.markdown(f"**[{idx}]** *{chunk.source_name}* — {chunk.section_path}")
+                    st.caption(f"Similitud: {score:.3f}")
+                    st.text(chunk.text[:400] + ("…" if len(chunk.text) > 400 else ""))
 
-st.markdown("---")
-st.caption("Democracia+ Streamlit POC — uses gpt-4o-mini by default.")
+# ----------------------- Main entrypoint -----------------------
+
+def main():
+    st.set_page_config(
+        page_title="D+ Chatbot — Democracia+",
+        page_icon="🗳️",
+        layout="wide",
+    )
+
+    check_openai_key()
+    cfg = load_config()
+    init_session_state(cfg)
+
+    with st.sidebar:
+        st.markdown("## D+ Chatbot")
+        page = st.radio("Secciones", ["Chat", "Admin"], index=0)
+
+    if page == "Chat":
+        render_chat_page()
+    else:
+        render_admin_page()
+
+if __name__ == "__main__":
+    main()
