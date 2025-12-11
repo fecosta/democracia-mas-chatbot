@@ -16,6 +16,8 @@ import io
 import json
 import time
 import hashlib
+import uuid
+from datetime import datetime
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any
 
@@ -29,6 +31,7 @@ from openai import OpenAI
 DATA_DIR = os.environ.get("DPLUS_DATA_DIR", "data")
 DOCS_DIR = os.path.join(DATA_DIR, "docs")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
+CHAT_LOG_PATH = os.path.join(DATA_DIR, "chat_history.jsonl")
 
 DEFAULT_CONFIG = {
     "chat_model": os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
@@ -62,27 +65,27 @@ class Chunk:
     section_path: str
     page_number: int | None = None
 
+
 @dataclass
 class Corpus:
     chunks: List[Chunk]
     embeddings: np.ndarray  # shape: (n_chunks, dim)
 
-# ----------------------- OpenAI client -----------------------
 
-client = OpenAI()
+# ----------------------- Utility helpers -----------------------
 
 def check_openai_key():
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not os.getenv("OPENAI_API_KEY"):
         st.error(
-            "OPENAI_API_KEY is not set. Please add it as an environment variable "
-            "in your deployment platform."
+            "No se encontró la variable de entorno `OPENAI_API_KEY`. "
+            "Defínala antes de ejecutar la aplicación."
         )
         st.stop()
 
-# ----------------------- Persistence helpers -----------------------
 
 def ensure_data_dirs():
     os.makedirs(DOCS_DIR, exist_ok=True)
+
 
 def load_config() -> Dict[str, Any]:
     ensure_data_dirs()
@@ -98,10 +101,12 @@ def load_config() -> Dict[str, Any]:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
 
+
 def save_config(cfg: Dict[str, Any]) -> None:
     ensure_data_dirs()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
 
 def list_document_files() -> List[Tuple[str, str, float]]:
     """
@@ -119,10 +124,12 @@ def list_document_files() -> List[Tuple[str, str, float]]:
         files.append((name, path, mtime))
     return files
 
+
 def delete_document(name: str) -> None:
     path = os.path.join(DOCS_DIR, name)
     if os.path.exists(path):
         os.remove(path)
+
 
 # ----------------------- Text splitting & embeddings -----------------------
 
@@ -140,65 +147,83 @@ def split_text(text: str, max_chars: int = 3500, overlap_chars: int = 500) -> Li
         else:
             if buf:
                 chunks.append(buf)
-            while len(p) > max_chars:
-                chunks.append(p[:max_chars])
-                p = p[max_chars - overlap_chars :]
-            buf = p
+            # start new buffer with overlap from the end of the previous buf
+            if len(p) > max_chars:
+                # Hard split big paragraph
+                start = 0
+                while start < len(p):
+                    end = start + max_chars
+                    chunks.append(p[start:end])
+                    start = end - overlap_chars
+            else:
+                buf = p
+
     if buf:
         chunks.append(buf)
-    return chunks
+
+    # Add overlaps
+    final_chunks: List[str] = []
+    for i, c in enumerate(chunks):
+        if i == 0:
+            final_chunks.append(c)
+        else:
+            prev = chunks[i - 1]
+            overlap = prev[-overlap_chars:]
+            final_chunks.append(overlap + "\n\n" + c)
+
+    return final_chunks
+
+
+def read_pdf(path: str) -> str:
+    with open(path, "rb") as f:
+        reader = PdfReader(f)
+        texts = []
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            texts.append(t)
+    return "\n\n".join(texts)
+
+
+def load_document_text(path: str) -> str:
+    if path.lower().endswith(".pdf"):
+        return read_pdf(path)
+    else:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+
 
 def embed_texts(model: str, texts: List[str]) -> np.ndarray:
-    if not texts:
-        return np.zeros((0, 3072), dtype=np.float32)
+    """
+    Call OpenAI embeddings API for a batch of texts.
+    """
+    client = OpenAI()
+    resp = client.embeddings.create(model=model, input=texts)
+    vectors = [np.array(d.embedding, dtype=np.float32) for d in resp.data]
+    return np.vstack(vectors)
 
-    res = client.embeddings.create(model=model, input=texts)
-    # We assume text-embedding-3-large dim (3072). If another is used, numpy will infer.
-    vectors = np.array([d.embedding for d in res.data], dtype=np.float32)
-    return vectors
 
-@st.cache_resource(show_spinner=True)
 def build_corpus_from_disk(embed_model: str, file_infos: List[Tuple[str, str, float]]) -> Corpus:
     """
-    file_infos: list of (name, path, mtime). mtime is used so that index is rebuilt
-    when a file is updated.
+    Build or rebuild the corpus from documents on disk.
     """
     chunks: List[Chunk] = []
 
-    for name, path, _ in file_infos:
-        ext = name.lower().split(".")[-1]
-        with open(path, "rb") as f:
-            content_bytes = f.read()
-
-        if ext == "pdf":
-            reader = PdfReader(io.BytesIO(content_bytes))
-            for i, page in enumerate(reader.pages):
-                text = page.extract_text() or ""
-                if not text.strip():
-                    continue
-                for j, t in enumerate(split_text(text)):
-                    chunks.append(
-                        Chunk(
-                            text=t,
-                            source_name=name,
-                            section_path=f"page-{i+1}/chunk-{j+1}",
-                            page_number=i + 1,
-                        )
-                    )
-        elif ext in ("txt", "md"):
-            text = content_bytes.decode("utf-8", errors="ignore")
-            for j, t in enumerate(split_text(text)):
-                chunks.append(
-                    Chunk(
-                        text=t,
-                        source_name=name,
-                        section_path=f"chunk-{j+1}",
-                        page_number=None,
-                    )
+    for name, path, mtime in file_infos:
+        text = load_document_text(path)
+        base_name = os.path.splitext(name)[0]
+        for i, chunk_text in enumerate(split_text(text)):
+            chunks.append(
+                Chunk(
+                    text=chunk_text,
+                    source_name=name,
+                    section_path=f"{base_name} (parte {i+1})",
+                    page_number=None,
                 )
+            )
 
     embeddings = embed_texts(embed_model, [c.text for c in chunks])
     return Corpus(chunks=chunks, embeddings=embeddings)
+
 
 # ----------------------- Retrieval -----------------------
 
@@ -218,79 +243,107 @@ def retrieve_similar(corpus: Corpus, query: str, embed_model: str, top_k: int) -
     idxs = np.argsort(-sims)[:top_k]
     return [(corpus.chunks[i], float(sims[i])) for i in idxs]
 
+
 # ----------------------- Prompt construction -----------------------
 
 def language_instruction(lang_code: str) -> str:
     if lang_code == "es":
-        return "Responde en español latinoamericano claro y accesible."
+        return (
+            "Responde en **español** con un tono claro, accesible y profesional. "
+            "Usa párrafos cortos y, cuando sea útil, listas con viñetas."
+        )
     if lang_code == "pt":
-        return "Responda em português brasileiro, de forma clara e acessível."
+        return (
+            "Responda em **português** com um tom claro, acessível e profissional. "
+            "Use parágrafos curtos e, quando útil, listas com marcadores."
+        )
     if lang_code == "en":
-        return "Answer in clear and accessible English."
+        return (
+            "Answer in **English** with a clear, accessible and professional tone. "
+            "Use short paragraphs and bullet lists when helpful."
+        )
+    # auto: decide based on user input
     return (
-        "Responde en el mismo idioma de la pregunta. Si la pregunta mezcla idiomas, "
-        "prioriza español o portugués según el contenido."
+        "Responde en el mismo idioma de la pregunta (español o portugués) "
+        "con un tono claro, accesible y profesional."
     )
 
-def build_system_prompt() -> str:
+
+def build_system_prompt(answer_lang: str) -> str:
     return (
-        "Eres el asistente oficial de Democracia+, una organización que trabaja para "
-        "fortalecer la democracia en América Latina. Respondes de manera rigurosa, "
-        "didáctica y constructiva, siempre fomentando la participación política, la "
-        "ética pública y el fortalecimiento institucional.\n\n"
-        "Usa EXCLUSIVAMENTE la información proporcionada en los documentos cargados "
-        "como contexto. Si no encuentras la respuesta allí, sé honesto y di que no "
-        "tienes información suficiente, sugiriendo cómo la persona podría profundizar "
-        "el tema.\n\n"
-        "Cuando te refieras explícitamente a partes de los documentos, cita las fuentes "
-        "entre corchetes con el formato [1], [2], etc."
+        "Eres el asistente de Democracia+, una organización dedicada a fortalecer "
+        "la democracia y el liderazgo político en América Latina.\n\n"
+        "Tu tarea es responder preguntas usando exclusivamente los materiales "
+        "proporcionados (playbooks, artículos, transcripciones y otros documentos "
+        "de Democracia+). Si la información no aparece en los documentos, "
+        "sé transparente y di que no tienes datos suficientes.\n\n"
+        "Cuando cites ideas específicas de los materiales, intenta parafrasear "
+        "y conectar los conceptos con ejemplos prácticos de participación política, "
+        "liderazgo y fortalecimiento institucional.\n\n"
+        f"{language_instruction(answer_lang)}"
     )
 
-def build_context_block(retrieved: List[Tuple[Chunk, float]]) -> str:
-    lines = []
-    for idx, (chunk, score) in enumerate(retrieved, start=1):
-        loc = f"{chunk.source_name} — {chunk.section_path}"
-        lines.append(f"[{idx}] {loc}\n{chunk.text}")
-    return "\n\n".join(lines)
 
-def call_chat_api(
-    model: str,
-    temperature: float,
-    query: str,
-    retrieved: List[Tuple[Chunk, float]],
-    answer_lang: str,
+def build_messages(
+    user_query: str,
+    retrieved_chunks: List[Tuple[Chunk, float]],
     history: List[Dict[str, str]],
-) -> str:
-    system_prompt = build_system_prompt()
-    lang_instr = language_instruction(answer_lang)
-    context_block = build_context_block(retrieved)
+    answer_lang: str,
+) -> List[Dict[str, str]]:
+    """
+    Build chat history for the OpenAI Chat API.
+    """
+    system_prompt = build_system_prompt(answer_lang)
 
-    messages = [
+    context_intro = (
+        "A continuación tienes fragmentos relevantes de los materiales de Democracia+. "
+        "Úsalos como base para tu respuesta. Si algún fragmento no es relevante, "
+        "ignóralo.\n\n"
+    )
+
+    context_blocks = []
+    for i, (chunk, score) in enumerate(retrieved_chunks, start=1):
+        header = f"[Fragmento {i} — {chunk.source_name} — {chunk.section_path} — similitud {score:.3f}]"
+        context_blocks.append(f"{header}\n{chunk.text}")
+
+    context_text = context_intro + "\n\n".join(context_blocks) if context_blocks else (
+        "No se encontraron fragmentos relevantes en los documentos. "
+        "Responde de forma general, aclarando que no estás usando material específico."
+    )
+
+    messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "system", "content": f"Instrucción de idioma: {lang_instr}"},
         {
             "role": "system",
             "content": (
-                "Contexto proveniente de los playbooks y materiales de Democracia+.\n"
-                "Utilízalo como base para tus respuestas, citando los fragmentos relevantes "
-                "como [1], [2], etc. cuando corresponda.\n\n"
-                f"{context_block}"
+                "Contexto documental disponible para esta pregunta:\n\n"
+                f"{context_text}"
             ),
         },
     ]
 
-    # Append short conversation history (without previous context blocks)
-    for m in history[-8:]:
-        messages.append(m)
+    # history trimming
+    max_hist = DEFAULT_CONFIG["max_history_messages"]
+    trimmed_history = history[-max_hist:] if max_hist > 0 else []
 
-    messages.append({"role": "user", "content": query})
+    messages.extend(trimmed_history)
+    messages.append({"role": "user", "content": user_query})
+    return messages
 
+
+def call_chat_completion(
+    model: str,
+    temperature: float,
+    messages: List[Dict[str, str]],
+) -> str:
+    client = OpenAI()
     resp = client.chat.completions.create(
         model=model,
         temperature=temperature,
         messages=messages,
     )
     return resp.choices[0].message.content
+
 
 # ----------------------- Streamlit UI helpers -----------------------
 
@@ -301,9 +354,137 @@ def init_session_state(cfg: Dict[str, Any]):
         st.session_state["config"] = cfg
     if "last_index_mtime" not in st.session_state:
         st.session_state["last_index_mtime"] = 0.0
+    # Authentication & identity
+    if "session_id" not in st.session_state:
+        st.session_state["session_id"] = str(uuid.uuid4())
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    if "user_role" not in st.session_state:
+        st.session_state["user_role"] = "anonymous"
+    if "user_name" not in st.session_state:
+        st.session_state["user_name"] = None
+
 
 def add_message(role: str, content: str):
-    st.session_state["messages"].append({"role": role, "content": content})
+    """Append a message to the in-memory chat and persist it to disk.
+
+    Parameters
+    ----------
+    role:
+        "user" or "assistant".
+    content:
+        Message content.
+    """
+    msg = {"role": role, "content": content}
+    st.session_state["messages"].append(msg)
+    persist_chat_message(msg)
+
+
+def persist_chat_message(msg: Dict[str, Any]) -> None:
+    """Safely append a chat message to a JSONL log file.
+
+    This gives us a simple, append-only audit trail of all conversations,
+    which can later be analyzed offline or migrated to a proper database
+    (for example, Supabase) without changing the rest of the app.
+    """
+    try:
+        # Ensure base folder exists
+        ensure_data_dirs()
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "session_id": st.session_state.get("session_id"),
+            "user_role": st.session_state.get("user_role", "anonymous"),
+            "user_name": st.session_state.get("user_name"),
+            "message_role": msg.get("role"),
+            "content": msg.get("content"),
+        }
+        with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        # Never break the UI because of logging issues
+        print(f"[WARN] Could not persist chat message: {e}")
+
+
+# ----------------------- Authentication helpers -----------------------
+
+def get_admin_password() -> str:
+    """Return the administrator access code from environment.
+
+    Set this in your deployment environment as DPLUS_ADMIN_PASSWORD.
+    """
+    return os.getenv("DPLUS_ADMIN_PASSWORD", "").strip()
+
+
+def get_user_password() -> str:
+    """Return the (optional) regular user access code from environment.
+
+    If DPLUS_USER_PASSWORD is not set, any user can log in as "Usuario"
+    without a password. If it is set, the password will be required.
+    """
+    return os.getenv("DPLUS_USER_PASSWORD", "").strip()
+
+
+def render_auth_sidebar() -> None:
+    """Render the login / logout controls in the sidebar.
+
+    The app distinguishes two roles:
+      - "admin": can access the Admin page and manage documents/config.
+      - "user": can only use the Chat page.
+
+    Roles are determined by shared access codes configured via environment
+    variables (DPLUS_ADMIN_PASSWORD and optionally DPLUS_USER_PASSWORD).
+    """
+    st.subheader("Acceso")
+
+    # Already logged in
+    if st.session_state.get("authenticated"):
+        role = st.session_state.get("user_role", "anonymous")
+        name = st.session_state.get("user_name")
+        label_role = "Admin" if role == "admin" else "Usuario"
+        display_name = name or label_role
+        st.success(f"Conectado como {display_name}")
+
+        if st.button("Cerrar sesión"):
+            # Clear session-related fields and start fresh
+            for key in ["authenticated", "user_role", "user_name", "messages", "session_id"]:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.experimental_rerun()
+        return
+
+    # Not logged in yet: show login form
+    name = st.text_input("Tu nombre", key="login_name")
+    requested_role = st.selectbox("Perfil", ["Usuario", "Admin"], key="login_role")
+    password = st.text_input("Código de acceso", type="password", key="login_password")
+
+    if st.button("Iniciar sesión"):
+        if requested_role == "Admin":
+            admin_pw = get_admin_password()
+            if not admin_pw:
+                st.error(
+                    "No hay contraseña de administrador configurada. "
+                    "Defina la variable de entorno DPLUS_ADMIN_PASSWORD."
+                )
+                return
+            if password != admin_pw:
+                st.error("Código de acceso incorrecto para administrador.")
+                return
+            st.session_state["authenticated"] = True
+            st.session_state["user_role"] = "admin"
+        else:
+            user_pw = get_user_password()
+            if user_pw and password != user_pw:
+                st.error("Código de acceso incorrecto.")
+                return
+            st.session_state["authenticated"] = True
+            st.session_state["user_role"] = "user"
+
+        st.session_state["user_name"] = name or None
+        # Reset chat for a clean session when logging in
+        st.session_state["messages"] = []
+        st.session_state["session_id"] = str(uuid.uuid4())
+        st.experimental_rerun()
+
 
 # ----------------------- Admin page -----------------------
 
@@ -324,48 +505,78 @@ def render_admin_page():
         chat_model = st.selectbox(
             "Modelo de chat",
             options=SUPPORTED_CHAT_MODELS,
-            index=max(SUPPORTED_CHAT_MODELS.index(cfg.get("chat_model", DEFAULT_CONFIG["chat_model"])) if cfg.get("chat_model") in SUPPORTED_CHAT_MODELS else 0, 0),
+            index=max(
+                SUPPORTED_CHAT_MODELS.index(cfg.get("chat_model", DEFAULT_CONFIG["chat_model"]))
+                if cfg.get("chat_model") in SUPPORTED_CHAT_MODELS
+                else 0,
+                0,
+            ),
         )
-        temperature = st.slider("Temperatura", min_value=0.0, max_value=1.0, value=float(cfg.get("temperature", DEFAULT_CONFIG["temperature"])), step=0.05)
+        cfg["chat_model"] = chat_model
+
+        temperature = st.slider(
+            "Temperatura (creatividad)",
+            min_value=0.0,
+            max_value=1.0,
+            step=0.05,
+            value=float(cfg.get("temperature", DEFAULT_CONFIG["temperature"])),
+        )
+        cfg["temperature"] = float(temperature)
 
     with col2:
-        answer_lang_label_to_code = ANSWER_LANG_OPTIONS
-        current_lang_code = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
-        current_label = next((label for label, code in answer_lang_label_to_code.items() if code == current_lang_code), "Auto")
-        answer_lang_label = st.selectbox("Idioma por defecto de la respuesta", list(answer_lang_label_to_code.keys()), index=list(answer_lang_label_to_code.keys()).index(current_label))
-        top_k = st.slider("Número de fragmentos de contexto (Top K)", min_value=2, max_value=12, value=int(cfg.get("top_k", DEFAULT_CONFIG["top_k"])))
+        embed_model = st.text_input(
+            "Modelo de embeddings",
+            value=cfg.get("embedding_model", DEFAULT_CONFIG["embedding_model"]),
+            help="Normalmente no es necesario cambiar esto.",
+        )
+        cfg["embedding_model"] = embed_model
+
+        top_k = st.slider(
+            "Número de fragmentos a recuperar (top_k)",
+            min_value=1,
+            max_value=12,
+            value=int(cfg.get("top_k", DEFAULT_CONFIG["top_k"])),
+        )
+        cfg["top_k"] = int(top_k)
+
+    st.subheader("Idioma de respuesta")
+    label_to_code = ANSWER_LANG_OPTIONS
+    code_to_label = {v: k for k, v in label_to_code.items()}
+    current_code = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
+    current_label = code_to_label.get(current_code, "Auto")
+    selected_label = st.radio(
+        "Idioma por defecto",
+        options=list(label_to_code.keys()),
+        index=list(label_to_code.keys()).index(current_label),
+        help="Puede cambiar el idioma de las respuestas del asistente.",
+    )
+    cfg["default_answer_lang"] = label_to_code[selected_label]
 
     if st.button("Guardar configuración"):
-        cfg["chat_model"] = chat_model
-        cfg["temperature"] = float(temperature)
-        cfg["top_k"] = int(top_k)
-        cfg["default_answer_lang"] = answer_lang_label_to_code[answer_lang_label]
-        st.session_state["config"] = cfg
         save_config(cfg)
         st.success("Configuración guardada.")
 
     st.divider()
-    st.subheader("Documentos")
+    st.subheader("Gestión de documentos")
 
+    # Upload new docs
     uploaded_files = st.file_uploader(
-        "Subir nuevos documentos (PDF, TXT, MD)",
+        "Subir documentos (.pdf, .txt, .md)",
         type=["pdf", "txt", "md"],
         accept_multiple_files=True,
-        help="Estos documentos alimentan el conocimiento del chatbot.",
     )
-
     if uploaded_files:
         ensure_data_dirs()
-        for f in uploaded_files:
-            dest = os.path.join(DOCS_DIR, f.name)
-            with open(dest, "wb") as out:
-                out.write(f.read())
-        st.success("Documentos subidos. Recuerde reconstruir el índice si es necesario.")
-        st.button("Actualizar lista de documentos", on_click=lambda: None)
+        for uf in uploaded_files:
+            dest_path = os.path.join(DOCS_DIR, uf.name)
+            with open(dest_path, "wb") as f:
+                f.write(uf.read())
+        st.success(f"Se cargaron {len(uploaded_files)} documento(s).")
 
+    # List current docs
     files = list_document_files()
     if not files:
-        st.info("No hay documentos cargados todavía.")
+        st.info("Aún no hay documentos cargados.")
     else:
         st.write(f"**{len(files)} documentos cargados:**")
         for name, path, mtime in files:
@@ -394,6 +605,7 @@ def render_admin_page():
         st.session_state["last_index_mtime"] = time.time()
         st.success("Índice borrado; será reconstruido automáticamente la próxima vez que se use el chatbot.")
 
+
 # ----------------------- Chat page -----------------------
 
 def render_chat_page():
@@ -412,19 +624,20 @@ def render_chat_page():
 
     embed_model = cfg["embedding_model"]
     top_k = int(cfg.get("top_k", DEFAULT_CONFIG["top_k"]))
-    answer_lang_default = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
+    answer_lang = cfg.get("default_answer_lang", DEFAULT_CONFIG["default_answer_lang"])
 
-    # Sidebar options
-    with st.sidebar:
-        st.header("Opciones de respuesta")
-        answer_lang_label = st.selectbox("Idioma de la respuesta", list(ANSWER_LANG_OPTIONS.keys()))
-        answer_lang = ANSWER_LANG_OPTIONS[answer_lang_label]
-
-        persona = st.selectbox(
-            "Enfoque del asistente",
-            ["Facilitador/a", "Formador/a de liderazgos", "Diseñador/a de políticas públicas"],
-            index=0,
-        )
+    # Optional persona selector (just an example, can be extended)
+    st.sidebar.markdown("### Modo del asistente")
+    persona = st.sidebar.selectbox(
+        "Elige el foco de la conversación",
+        [
+            "General Democracia+",
+            "Participación política",
+            "Liderazgo y formación",
+            "Políticas públicas y diseño institucional",
+        ],
+        index=0,
+    )
 
     # Load / build corpus
     file_infos_for_cache = [(name, path, mtime) for (name, path, mtime) in files]
@@ -454,27 +667,51 @@ def render_chat_page():
             top_k=top_k,
         )
 
-    # Build answer
-    history = st.session_state["messages"][:-1]  # everything before this question
-    effective_lang = answer_lang if answer_lang != "auto" else answer_lang_default
-    # Add persona nuance as a small extra instruction in the last user message
-    persona_hint = (
-        "Responde con el enfoque de un/a "
-        f"{persona.lower()}, conectando la respuesta con ejemplos prácticos y "
-        "recomendaciones accionables."
+    # Build messages for OpenAI
+    history = [m for m in st.session_state["messages"] if m["role"] in ("user", "assistant")]
+    messages = build_messages(
+        user_query=user_input,
+        retrieved_chunks=retrieved,
+        history=history[:-1],  # exclude current user message (already appended)
+        answer_lang=answer_lang,
     )
 
-    composed_query = user_input + "\n\n" + persona_hint
+    # Persona hint
+    persona_hint = ""
+    if persona == "Participación política":
+        persona_hint = (
+            "Enfócate en participación ciudadana, campañas, partidos políticos y formas "
+            "de involucrarse en la vida pública."
+        )
+    elif persona == "Liderazgo y formación":
+        persona_hint = (
+            "Enfócate en desarrollo de liderazgos, habilidades blandas, formación de equipos "
+            "y procesos pedagógicos."
+        )
+    elif persona == "Políticas públicas y diseño institucional":
+        persona_hint = (
+            "Enfócate en diseño de políticas públicas, instituciones democráticas y procesos "
+            "de toma de decisión."
+        )
 
+    if persona_hint:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Ajusta tu respuesta según el siguiente foco de conversación:\n"
+                    f"{persona_hint}"
+                ),
+            }
+        )
+
+    # Call OpenAI
     with st.chat_message("assistant"):
         try:
-            answer = call_chat_api(
-                model=cfg.get("chat_model", DEFAULT_CONFIG["chat_model"]),
+            answer = call_chat_completion(
+                model=cfg["chat_model"],
                 temperature=float(cfg.get("temperature", DEFAULT_CONFIG["temperature"])),
-                query=composed_query,
-                retrieved=retrieved,
-                answer_lang=effective_lang,
-                history=history,
+                messages=messages,
             )
         except Exception as e:
             st.error(f"Error al llamar a la API de OpenAI: {e}")
@@ -493,6 +730,7 @@ def render_chat_page():
                     st.caption(f"Similitud: {score:.3f}")
                     st.text(chunk.text[:400] + ("…" if len(chunk.text) > 400 else ""))
 
+
 # ----------------------- Main entrypoint -----------------------
 
 def main():
@@ -508,12 +746,25 @@ def main():
 
     with st.sidebar:
         st.markdown("## D+ Chatbot")
-        page = st.radio("Secciones", ["Chat", "Admin"], index=0)
+        # Authentication & role selection
+        render_auth_sidebar()
+        if st.session_state.get("authenticated"):
+            page = st.radio("Secciones", ["Chat", "Admin"], index=0)
+        else:
+            page = None
+
+    if not st.session_state.get("authenticated"):
+        st.info("Inicie sesión en la barra lateral para comenzar a usar el chatbot.")
+        return
 
     if page == "Chat":
         render_chat_page()
-    else:
-        render_admin_page()
+    elif page == "Admin":
+        if st.session_state.get("user_role") != "admin":
+            st.error("Solo las personas administradoras pueden acceder a esta sección.")
+        else:
+            render_admin_page()
+
 
 if __name__ == "__main__":
     main()
