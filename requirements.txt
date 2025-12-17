@@ -3,5 +3,5 @@ openai>=1.50,<1.60
 pypdf>=4.2,<5
 langdetect==1.0.9
 numpy<2
-anthropic>=0.3.0,<0.4.0
+anthropic>0.7
 # tiktoken/faiss omitted to avoid build issues
