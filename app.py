@@ -610,6 +610,5 @@ def main() -> None:
     else:
         render_chat_page()
 
-
 if __name__ == "__main__":
     main()
