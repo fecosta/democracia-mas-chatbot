@@ -20,14 +20,13 @@ import time
 import uuid
 from datetime import datetime
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
 
+from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
 from anthropic import Anthropic
-
 
 # ----------------------- Paths & Defaults -----------------------
 
