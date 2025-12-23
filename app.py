@@ -20,13 +20,14 @@ import time
 import uuid
 from datetime import datetime
 from dataclasses import dataclass
-
 from typing import List, Tuple, Dict, Any, Optional
+
 import numpy as np
 import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
 from anthropic import Anthropic
+
 
 # ----------------------- Paths & Defaults -----------------------
 
@@ -36,21 +37,21 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CHAT_LOG_PATH = os.path.join(DATA_DIR, "chat_history.jsonl")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    "chat_model": "claude-3-5-sonnet-latest",
+    # ✅ Changed from claude-3-5-sonnet-latest to stable Claude 3 model id
+    "chat_model": "claude-3-sonnet-20240229",
     "embedding_model": "text-embedding-3-large",
     "temperature": 0.25,
     "top_k": 6,
-    "max_history_messages": 8,     # user/assistant turns (Claude is good with short history + strong context)
-    "max_tokens": 1200,            # Claude output tokens
-    "default_answer_lang": "auto", # auto | es | pt | en
+    "max_history_messages": 8,
+    "max_tokens": 1200,
+    "default_answer_lang": "auto",  # auto | es | pt | en
 }
 
+# ✅ Updated to stable, widely available model IDs
 SUPPORTED_CLAUDE_MODELS = [
-    "claude-3-5-sonnet-latest",
-    "claude-3-5-haiku-latest",
-    "claude-3-opus-latest",
-    "claude-3-sonnet-latest",
-    "claude-3-haiku-latest",
+    "claude-3-sonnet-20240229",  # recommended default
+    "claude-3-haiku-20240307",   # fastest/cheapest
+    "claude-3-opus-20240229",    # strongest (expensive)
 ]
 
 ANSWER_LANG_OPTIONS = {
@@ -102,8 +103,8 @@ def load_config() -> Dict[str, Any]:
             if isinstance(loaded, dict):
                 cfg.update(loaded)
         except Exception:
-            # Keep defaults if config corrupt
             pass
+
     # guard model
     if cfg.get("chat_model") not in SUPPORTED_CLAUDE_MODELS:
         cfg["chat_model"] = DEFAULT_CONFIG["chat_model"]
@@ -177,7 +178,6 @@ def split_text(text: str, max_chars: int = 3500, overlap_chars: int = 500) -> Li
     if buf:
         chunks.append(buf)
 
-    # add overlap between chunks (simple char overlap)
     final_chunks: List[str] = []
     for i, c in enumerate(chunks):
         if i == 0:
@@ -214,7 +214,11 @@ def build_corpus_from_disk(embed_model: str, file_infos: List[Tuple[str, str, fl
                 )
             )
 
-    embeddings = embed_texts_openai(embed_model, [c.text for c in chunks]) if chunks else np.zeros((0, 1), dtype=np.float32)
+    embeddings = (
+        embed_texts_openai(embed_model, [c.text for c in chunks])
+        if chunks
+        else np.zeros((0, 1), dtype=np.float32)
+    )
     return Corpus(chunks=chunks, embeddings=embeddings)
 
 
@@ -301,7 +305,6 @@ def call_claude(
         system=system_prompt,
         messages=messages,
     )
-    # Anthropic returns content blocks
     return "".join([block.text for block in resp.content if getattr(block, "type", None) == "text"])
 
 
@@ -321,7 +324,6 @@ def persist_chat_message(msg: Dict[str, Any]) -> None:
         with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        # do not break app on logging failure
         print(f"[WARN] Could not persist chat message: {e}")
 
 
@@ -440,7 +442,6 @@ def render_admin_page() -> None:
             with open(dest, "wb") as f:
                 f.write(uf.read())
         st.success(f"Uploaded {len(uploaded)} file(s).")
-        # corpus cache depends on file_infos; no need to clear manually, but safe:
         build_corpus_from_disk.clear()
 
     files = list_document_files()
@@ -502,11 +503,9 @@ def render_chat_page() -> None:
     elif persona == "Public policy & institutional design":
         persona_hint = "Focus on policy design, democratic institutions, governance, and decision-making processes."
 
-    # Build corpus (cached)
     file_infos = [(n, p, m) for (n, p, m) in files]
     corpus = build_corpus_from_disk(cfg["embedding_model"], file_infos)
 
-    # Display history
     for m in st.session_state["messages"]:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
@@ -522,16 +521,12 @@ def render_chat_page() -> None:
     with st.spinner("Retrieving relevant excerpts…"):
         retrieved = retrieve_similar(corpus, user_input, cfg["embedding_model"], int(cfg["top_k"]))
 
-    # Claude messages: we keep only user/assistant turns (no system inside messages)
     history = [m for m in st.session_state["messages"] if m["role"] in ("user", "assistant")]
     max_hist = int(cfg.get("max_history_messages", DEFAULT_CONFIG["max_history_messages"]))
     trimmed_history = history[-max_hist:] if max_hist > 0 else []
 
-    # Build the final user message containing context + question
     user_with_context = build_user_turn_with_context(user_input, retrieved, persona_hint)
 
-    # Claude messages include: trimmed prior turns + current user turn (with context)
-    # Note: We do NOT include retrieved context in previous turns; only in current question.
     claude_messages: List[Dict[str, str]] = trimmed_history[:-1] if trimmed_history else []
     claude_messages.append({"role": "user", "content": user_with_context})
 
@@ -608,6 +603,7 @@ def main() -> None:
             render_admin_page()
     else:
         render_chat_page()
+
 
 if __name__ == "__main__":
     main()
