@@ -37,21 +37,18 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 CHAT_LOG_PATH = os.path.join(DATA_DIR, "chat_history.jsonl")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
-    # ✅ Changed from claude-3-5-sonnet-latest to stable Claude 3 model id
-    "chat_model": "claude-3-sonnet-20240229",
+    "chat_model": "claude-3-haiku-20240307",  # ✅ guaranteed access
     "embedding_model": "text-embedding-3-large",
     "temperature": 0.25,
     "top_k": 6,
     "max_history_messages": 8,
     "max_tokens": 1200,
-    "default_answer_lang": "auto",  # auto | es | pt | en
+    "default_answer_lang": "auto",
 }
 
 # ✅ Updated to stable, widely available model IDs
 SUPPORTED_CLAUDE_MODELS = [
-    "claude-3-sonnet-20240229",  # recommended default
-    "claude-3-haiku-20240307",   # fastest/cheapest
-    "claude-3-opus-20240229",    # strongest (expensive)
+    "claude-3-haiku-20240307",  # ✅ only safe model
 ]
 
 ANSWER_LANG_OPTIONS = {
