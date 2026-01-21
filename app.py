@@ -22,6 +22,7 @@ import uuid
 import sqlite3
 import hashlib
 import secrets
+import logging
 from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
@@ -31,6 +32,9 @@ import streamlit as st
 from pypdf import PdfReader
 from openai import OpenAI
 from anthropic import Anthropic
+
+# Reduce noisy PDF parsing warnings
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 # ----------------------- Paths & Defaults -----------------------
@@ -408,12 +412,26 @@ def get_active_doc_paths() -> List[Tuple[str, str, float]]:
 # ----------------------- Text parsing / chunking -----------------------
 
 def read_pdf(path: str) -> str:
-    with open(path, "rb") as f:
-        reader = PdfReader(f)
-        texts = []
-        for page in reader.pages:
-            texts.append(page.extract_text() or "")
-        return "\n\n".join(texts)
+    """Best-effort PDF text extraction.
+
+    Some PDFs are malformed; pypdf may log warnings like
+    'Ignoring wrong pointing object ...'. Those warnings are harmless
+    but noisy. We also guard against extraction errors and return
+    partial text when possible.
+    """
+    try:
+        with open(path, "rb") as f:
+            reader = PdfReader(f, strict=False)
+            texts: List[str] = []
+            for page in reader.pages:
+                try:
+                    texts.append(page.extract_text() or "")
+                except Exception:
+                    # Skip pages that fail extraction
+                    continue
+            return "\n\n".join(texts)
+    except Exception:
+        return ""
 
 
 def load_document_text(path: str) -> str:
@@ -772,13 +790,11 @@ def render_chat(cfg: Dict[str, Any], user_id: str) -> None:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-    # Build corpus from active docs
+    # Documents for retrieval (we build the index lazily on first question)
     doc_infos = get_active_doc_paths()
     if not doc_infos:
         st.info("No documents uploaded yet. Ask an admin to upload content in Admin area.")
         return
-
-    corpus = build_corpus(cfg["embedding_model"], doc_infos)
 
     user_input = st.chat_input("Ask about Democracia+ materials…")
     if not user_input:
@@ -788,6 +804,9 @@ def render_chat(cfg: Dict[str, Any], user_id: str) -> None:
     add_message_db(conversation_id, "user", user_input)
     with st.chat_message("user"):
         st.markdown(user_input)
+
+    with st.spinner("Indexing documents (first run may take a few minutes)…"):
+        corpus = build_corpus(cfg["embedding_model"], doc_infos)
 
     with st.spinner("Retrieving relevant excerpts…"):
         retrieved = retrieve_similar(corpus, user_input, cfg["embedding_model"], int(cfg["top_k"]))
