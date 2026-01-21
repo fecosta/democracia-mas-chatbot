@@ -1,6 +1,4 @@
 /data
-.venv
-.devecontainer
 .bkp
 *.zip
 .DS_Store
