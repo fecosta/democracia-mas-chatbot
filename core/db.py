@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-import json
 from typing import Dict, List, Optional
 
 from .paths import db_path, get_data_dir
@@ -63,8 +62,7 @@ def init_db() -> None:
             is_deleted INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(uploaded_by) REFERENCES users(id)
         );
-
-
+        
         CREATE TABLE IF NOT EXISTS upload_events (
             id TEXT PRIMARY KEY,
             ts TEXT NOT NULL,
@@ -75,7 +73,9 @@ def init_db() -> None:
             doc_id TEXT,
             details TEXT
         );
-        """
+
+        CREATE INDEX IF NOT EXISTS idx_upload_events_ts ON upload_events(ts);
+"""
     )
     con.commit()
     con.close()
@@ -238,66 +238,39 @@ def soft_delete_document(doc_id: str) -> None:
     con.execute("UPDATE documents SET is_deleted=1 WHERE id=?", (doc_id,))
     con.commit()
     con.close()
+import json
+from datetime import datetime
 
+def _utc_now() -> str:
+    return datetime.utcnow().isoformat()
 
-# --- upload events / diagnostics ---
-
-def log_event(
-    user_id: Optional[str],
-    action: str,
-    filename: Optional[str] = None,
-    sha256: Optional[str] = None,
-    doc_id: Optional[str] = None,
-    details: Optional[Dict] = None,
-) -> None:
+def log_event(user_id: str | None, action: str, filename: str | None = None, sha256: str | None = None,
+              doc_id: str | None = None, details: dict | None = None) -> None:
     con = connect()
     con.execute(
-        """
-        INSERT INTO upload_events (id, ts, user_id, action, filename, sha256, doc_id, details)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            str(uuid.uuid4()),
-            utc_now_iso(),
-            user_id,
-            action,
-            filename,
-            sha256,
-            doc_id,
-            json.dumps(details or {}, ensure_ascii=False),
-        ),
+        "INSERT INTO upload_events (id, ts, user_id, action, filename, sha256, doc_id, details) VALUES (?,?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), _utc_now(), user_id, action, filename, sha256, doc_id, json.dumps(details or {}, ensure_ascii=False)),
     )
     con.commit()
     con.close()
 
+def list_recent_events(limit: int = 200):
+    con = connect()
+    rows = con.execute("SELECT * FROM upload_events ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()
+    con.close()
+    return rows
 
-def document_by_sha256(sha256_hex: str):
+def get_document_by_sha256(sha256_hex: str):
     con = connect()
     row = con.execute(
-        """
-        SELECT *
-        FROM documents
-        WHERE sha256 = ?
-          AND is_deleted = 0
-        ORDER BY uploaded_at DESC
-        LIMIT 1
-        """,
+        "SELECT * FROM documents WHERE sha256=? AND is_deleted=0 ORDER BY uploaded_at DESC LIMIT 1",
         (sha256_hex,),
     ).fetchone()
     con.close()
     return row
 
-
-def list_recent_events(limit: int = 200):
+def get_document(doc_id: str):
     con = connect()
-    rows = con.execute(
-        """
-        SELECT *
-        FROM upload_events
-        ORDER BY ts DESC
-        LIMIT ?
-        """,
-        (int(limit),),
-    ).fetchall()
+    row = con.execute("SELECT * FROM documents WHERE id=? LIMIT 1", (doc_id,)).fetchone()
     con.close()
-    return rows
+    return row
