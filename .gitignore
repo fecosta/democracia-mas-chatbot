@@ -4,13 +4,3 @@
 .bkp
 *.zip
 .DS_Store
-*.log
-__pycache__/
-*.pyc
-.env
-.vscode/
-.idea/
-node_modules/
-dist/
-build/
-*.egg-info/
